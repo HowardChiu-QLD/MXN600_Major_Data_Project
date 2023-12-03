@@ -1,0 +1,869 @@
+---
+title: "Credit_Risk_2023"
+author: "Team_12"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+The purpose of this report is to provide senior management with a comprehensive understanding of our new loan default prediction model for loan applications. The performance of our previous model was notably poor, as evidenced by the ROC curve, which closely resembled that of a random classifier, and a Gini index close to 0, indicating an imperfect model. Consequently, we embarked on developing a new model with the goal of improving both the Gini index and the ROC curve's predictive accuracy for loan default.
+
+Traditionally, the assessment of credit risk has been divided into three key components: Probability of Default (PD), Loss Given Default (LGD), and Exposure at Default (EAD). Among these, PD, which includes factors such as debt-to-income (DTI) ratio and credit score, has long been regarded as a crucial indicator of risk. Higher DTI ratios have conventionally been associated with an elevated risk of loan default. LGD demonstrates that, even when PD or DTI ratios are held constant, a larger loan amount results in a higher risk assessment. EAD represents the potential maximum loss an institution may incur in the event of a default, as is the case for our regional Australian bank.
+
+It is important to note that our dataset has already been labeled for repayment failure. In most instances, the failure to repay a loan is synonymous with loan default.
+
+## Data preparation
+
+```{r prep, echo=TRUE, message=FALSE, warning=FALSE}
+#Setup for analysis
+
+#Load the library
+library(tidyverse)
+library('pROC')
+library(png)
+library(grid)
+
+require(ggplot2)
+require(GGally)
+require(reshape2)
+require(lme4)
+require(compiler)
+require(parallel)
+require(boot)
+require(lattice)
+
+library(readr)
+library(GGally)
+library(ggpubr)
+library(foreign)
+library(nnet)
+library(ggplot2)
+library(DHARMa)
+library(reshape2)
+library(ROCR)
+library(pROC)
+
+#Load the raw data
+test <- read_csv("benchmark_testing_loan_data.csv")
+train <- read_csv("benchmark_training_loan_data.csv")
+val <- read_csv("benchmark_validation_loan_data.csv")
+df <- read_csv("extendend_version_loan_data.csv") # extended vesion dataset
+
+#Get rid of the first column as index
+test <- subset(test, select = -1)
+train <- subset(train, select = -1)
+val <- subset(val, select = -1)
+df <- subset(df, select = -1)
+
+#Convert some data to factor type as they are categorical variables in the extended dataset
+df$term <- factor(df$term)
+df$emp_length <- factor(df$emp_length)
+df$home_ownership <- factor(df$home_ownership)
+df$verification_status <- factor(df$verification_status)
+df$purpose <- factor(df$purpose)
+df$zip_code <- factor(df$zip_code)
+df$addr_state <- factor(df$addr_state)
+
+
+df$issue_d <- factor(df$issue_d)
+df$earliest_cr_line <- factor(df$earliest_cr_line)
+
+# Use dplyr to drop rows where emp_length contains "n/a"
+df <- df %>% filter(df$emp_length != "n/a")
+
+##head(df)
+```
+There are some n/a values in a emp_length column. Since, we have considerable amount of the data, we decided to drop these n/a values out. However, we acknowledged that, in real-world scenario, we are to ask our stakeholders if there is any underlying meaning in these values.
+Additionally, to avoid any issues that may occur during the modeling process, we will further standardise some data as these values have different scales, which may dominate the analysis and run into convergence errors.
+
+# Exploratory data analysis
+
+```{r summary, message=FALSE, warning=FALSE}
+summary(df)
+```
+
+From the summary, the loan_amnt ranges from a minimum of 500 to a maximum of 35,000. It appears to be slightly right skewed, as the mean loan amount is approximately 11171, while the median is 10000. A majority of the loans have a term of 36 months (74.2%), while 25.8% have a term of 60 months. int_rate represents the interest rate on the loans and ranges from a minimum of 5.42% to a maximum of 24.11%. "10+ years employment length" is the most common category. In addition, annual income ranges from a minimum of 1896 to 6 million. Most borrowers have annual incomes in the range of 41,000 to 83,000 dollars, falling in 25-75th percentiles. Debt_consolidation is the most common purpose for taking out loans. Lastly, "MORTGAGE" and "RENT" are the most common categories. 
+
+
+##Exploring the data - Continuous predictors
+
+```{r ggpairs, echo=TRUE, message=FALSE, warning=FALSE}
+ggpairs(df[, c("int_rate", "annual_inc", "dti", "revol_util", "credit_age_yrs")])
+```
+
+We used ggpairs to identify if there are any continuous predictors that highly correlated to each other, so we can exclude them due to multicollinearity.It seems to be that there might be unusual values in annual_inc variable. We observed the values and found that they are unlikely to be typographical errors. So, we maintained them to better capture patterns in the model. 
+
+
+Investigate a relationship between loan_amnt and repay_fail
+
+```{r boxplot, echo=TRUE}
+boxplot(df$loan_amnt~df$repay_fail,
+ylab="loan_amnt",xlab="repay_fail")
+```
+
+Surprisingly, considering only loan amount whether it has an impact on repay fail response, it seems to be that there is no relationship between these two. Thus, we should consider another covarients to effectively building the GLMM model.
+
+```{r corr ymp amd loan, echo=TRUE, message=FALSE, warning=FALSE}
+x1 <- scale(df$loan_amnt)
+y <- df$repay_fail
+g <- cut(x1, breaks=quantile(x1,seq(0,10,1)/10))
+ym <- tapply(y, g, mean)
+xm <- tapply(x1, g, mean)
+ymp <- log(ym/(1-ym))
+plot(xm,ymp,xlab="loan_amnt")
+
+```
+
+We, then explored relationship between $\log p(1-p)$ and $loan_amnt$ to get the idea about the form of the linear predictor. It appears that as the loan amount inceases, the higher chance that repay_fail gets closer to 1.
+
+```{r plot16ii,include=TRUE}
+par(mfrow = c(3, 2))
+selected_states <- c("CA", "NY", "FL", "TX", "NJ", "IL")
+for(i in selected_states){
+ind <- which(df$addr_state == i)
+
+x1 <- scale(df$loan_amnt)[ind]
+y <- df$repay_fail[ind]
+g <- cut(x1, breaks=quantile(x1,seq(0,10,1)/10))
+ym <- tapply(y, g, mean)
+xm <- tapply(x1, g, mean)
+ymp <- log(ym/(1-ym))
+plot(xm,ymp,main=paste("addr_state = ",i),xlab="loan_amnt")
+}
+```
+
+We demonstrated relationship between $\log p(1-p)$ and $loan_amnt$ in 6 states out of total 50 states as an example if they have different patterns. For example, New York, Texas, and New Jersey have shown slight downward trends at the beginning and then an increase as the loan amount increases. All of the example states have an increase in repay_fail as the loan_amount increase.
+
+```{r plot17ii,include=TRUE}
+par(mfrow = c(3, 3))
+selected_date <- c("Apr-09", "Apr-10", "Apr-11", 
+                   "Jul-09", "Jul-10", "Jul-11", 
+                   "Oct-09", "Oct-10", "Oct-11")
+for(i in selected_date){
+ind <- which(df$issue_d == i)
+
+x1 <- scale(df$loan_amnt)[ind]
+y <- df$repay_fail[ind]
+g <- cut(x1, breaks=quantile(x1,seq(0,10,1)/10))
+ym <- tapply(y, g, mean)
+xm <- tapply(x1, g, mean)
+ymp <- log(ym/(1-ym))
+plot(xm,ymp,main=paste("issue_d = ",i),xlab="loan_amnt")
+}
+```
+
+We demonstrated relationship between $\log p(1-p)$ and $loan_amnt$ in 3 mounts of each year from 2009 to 2011 as an example if they have different patterns. From the comparison, considering issue date as a random effect may capture some patterns in the model since each month of each year have distinct patterns.
+
+```{r corr box1, echo=TRUE, message=FALSE, warning=FALSE}
+boxplot(log(df$inq_last_6mths+1)~df$repay_fail,
+ylab="inq_last_6mths",xlab="repay_fail")
+```
+
+It appears that the number of inquiries in past 6 months (excluding auto and mortgage inquiries) may has little to no effect when we build the model 2. To efficiently build the model, we decided to exclude this variable from consideration.
+
+```{r corr scatter, echo=TRUE, message=FALSE, warning=FALSE}
+ggplot(data  = df,
+       aes(x = revol_util,
+           y = revol_bal))+
+  geom_point(size = 1.2,
+             alpha = .8,
+             position = "jitter")+# to add some random noise for plotting purposes
+  theme_minimal()+
+  labs(title = "revol_bal vs. revol_util")
+```
+
+We observed the relationship between Total credit revolving balance and Revolving line utilization rate to identify if there is a sign of collinearity and found that there is no strong correlation between these two. so, we include both of them in our model selection process.
+
+## Exploring the data - Discrete predictors
+
+```{r plots10, echo=TRUE, message=FALSE, warning=FALSE}
+ggpairs(df[, c("total_acc", "open_acc")])
+```
+
+It appears that there is a relatively strong positive correlation between The total number of credit lines currently in the borrower's credit file, and The number of open credit lines in the borrower's credit file. So, we decided to exclude the total_acc variable out of our consideration as multicollinearity issues may occur.
+
+```{r plot14, echo=TRUE, message=FALSE, warning=FALSE}
+ggplot(data  = df,
+       aes(x = earliest_cr_line,
+           y = credit_age_yrs))+
+  geom_point(size = 1.2,
+             alpha = .8,
+             position = "jitter")+# to add some random noise for plotting purposes
+  theme_minimal()+
+  labs(title = "earliest_cr_line vs. credit_age_yrs")
+```
+
+This plot might look inappropriate as we factorized the earliest_cr_line variable, which should be converted to date type instead. However, we can see that there is obviously a strong correlation between The month the borrower's earliest reported credit line was opened, and The number of years since the the borrowers earliest reported credit line. Thus, we exclude earliest_cr_line from our consideration.
+
+# Part 1 - Addressing the first two questions.
+
+In assessing the performance of our previous model, we found that its ability to predict loan defaults fell short of our expectations. The Gini score, an important measure of model effectiveness, was consistently close to zero, signaling the imperfection of the model. One noteworthy observation made by our team was the imbalanced nature of the dataset, potentially leading to an insufficient volume of data for effective model training.
+
+To better understand the degree of imbalance, the team conducted an assessment. If the proportion of minority class data exceeds 20%, we consider it a mild imbalance. In cases where the proportion falls between 1% and 20%, we categorize it as a moderate imbalance, and anything less than 1% is considered an extreme degree of imbalance. To aid in visualizing the distribution of each class of 'repay_fail,' we created a bar chart.
+
+```{r, echo=FALSE}
+# Create a bar plot
+barplot(table(train$repay_fail), col = c("red", "blue"), names.arg = c("0", "1"), 
+        xlab = "Repay fail", ylab = "Count", main = "Fail to Repay Loan Distribution")
+```
+
+```{r}
+#Check the imbalance level 20-40% mild, 1-20% moderate, <1% extreme
+repay_fail_count <- table(train$repay_fail)[["1"]]
+repay_success_count <- table(train$repay_fail)[["0"]]
+portion <- (repay_fail_count/(repay_fail_count+repay_success_count))*100
+cat("Proportion of minority:" ,portion,"\n")
+```
+
+Hence, the imbalance degree is moderate. This still impact the performance of the model but not severe.
+
+## New model
+
+The features' selection is conducted by running t-test on all features.
+
+```{r}
+model_feature <- glm(repay_fail ~ ., data = train, family = binomial)
+summary(model_feature)
+```
+
+Select all the numerical features into model and trial on lettin the financial behaviour variables interact with each other to build the model, check the goodness-of-fit and we got the evaluation result for running on validation data set.
+
+```{r}
+model <- glm(repay_fail ~ int_rate + inq_last_6mths + pub_rec + revol_bal + revol_util + annual_inc, data = train, family = "binomial")
+summary(model)
+```
+
+### Try interaction
+
+```{r}
+model_inter <- glm(repay_fail ~ int_rate + inq_last_6mths + pub_rec + revol_bal + revol_util + annual_inc + pub_rec*revol_bal*revol_util*int_rate*inq_last_6mths*annual_inc, data = train, family = "binomial")
+summary(model_inter)
+```
+
+Interaction maybe not needed. Run the goodness-of-fit to gain understanding for the fitness of data.
+
+## Goodness-of-fit
+
+```{r, echo = TRUE}
+# Standardise numerical data
+train$annual_inc <- scale(train$annual_inc)
+train$pub_rec <- scale(train$pub_rec)
+train$int_rate <- scale(train$int_rate) 
+train$revol_bal <- scale(train$revol_bal)
+train$revol_util <- scale(train$revol_util)
+train$inq_last_6mths <- scale(train$inq_last_6mths)
+test$annual_inc <- scale(test$annual_inc)
+test$pub_rec <- scale(test$pub_rec)
+test$int_rate <- scale(test$int_rate)
+test$revol_bal <- scale(test$revol_bal)
+test$revol_util <- scale(test$revol_util)
+test$inq_last_6mths <- scale(test$inq_last_6mths)
+val$annual_inc <- scale(val$annual_inc)
+val$pub_rec <- scale(val$pub_rec)
+val$int_rate <- scale(val$int_rate)
+val$revol_bal <- scale(val$revol_bal)
+val$revol_util <- scale(val$revol_util)
+val$inq_last_6mths <- scale(val$inq_last_6mths)
+
+# Fit the logistic regression model
+model <- glm(repay_fail ~ int_rate + inq_last_6mths + pub_rec + revol_bal + revol_util + annual_inc, data = train, family = "binomial")
+
+# Summary of the model
+summary(model)
+
+# Perform a goodness-of-fit test
+chisq_value <- qchisq(0.95, df = length(model$fitted.values) - 7) 
+
+# Deviance of the model
+deviance_value <- deviance(model)
+
+# Plot of fitted vs. residuals
+plot(fitted.values(model), residuals(model))
+points(c(0.3, 0.7), c(0, 0), type = "l")
+
+# Simulate residuals and create DHARMa diagnostic plots
+res <- simulateResiduals(model)
+plot(res)
+
+```
+
+The result indicates that the model might be non-linear and QQ-plot too good to be true. This might indicates that I missed some variables. Hence, I try to add more candidate variables to see if anything different.
+
+```{r}
+model_a <- glm(repay_fail ~ int_rate + inq_last_6mths + pub_rec + revol_bal + revol_util + annual_inc + purpose + term + emp_length + home_ownership + verification_status, data = train, family = binomial)
+summary(model_a)
+# Perform a goodness-of-fit test
+chisq_value <- qchisq(0.95, df = length(model$fitted.values) - 12) 
+
+# Deviance of the model
+deviance_value <- deviance(model)
+
+# Plot of fitted vs. residuals
+plot(fitted.values(model), residuals(model))
+points(c(0.3, 0.7), c(0, 0), type = "l")
+
+# Simulate residuals and create DHARMa diagnostic plots
+res <- simulateResiduals(model)
+plot(res)
+```
+
+The AIC shows that this new model is a better description of data, however, residual and simulated residual still stay the same.
+
+Assess predictive performance on ROC curve.
+
+```{r}
+#Numerical feature only taken into consideration
+#int_rate, #inq_last_6mths, pub_rec, revol_bal, revol_util, annual_inc
+model_1 <- multinom(repay_fail ~ int_rate + inq_last_6mths + pub_rec + revol_bal + revol_util + annual_inc, data = train)
+predict_1 <- predict(model_1, newdata = val, type = "probs")
+predict_obj_1 <- prediction(predict_1, val$repay_fail)
+performance_1 <- performance(predict_obj_1, "tpr", "fpr")
+summary(model_1)
+
+```
+
+In this complex model, the goodness-of-fit unfortunately did not fully satisfied. we can run Receiver Operating Characteristic (ROC) to see how much the model explained. In this section, we generate a ROC curve for comparison with the old model on the validation dataset. Since we only have the Gini score for the old model, we create a mock model to be plotted in a manner as closely aligned with the old model as possible.
+
+## Prediction 
+
+```{r}
+old_model <- multinom(repay_fail ~ dti + annual_inc + dti*annual_inc, data = train)
+predict_old <- predict(old_model, newdata = val, type = "probs")
+predict_obj_old <- prediction(predict_old, val$repay_fail)
+performance_obj_old <- performance(predict_obj_old, "tpr","fpr")
+auc_old <- performance(predict_obj_old, "auc")@y.values[[1]]
+gini_old <- 2*auc_old -1
+gini_old
+```
+
+The Gini score of this mock model is measured at 0.158 while the old model's Gini score is 0.110.
+
+```{r, echo = FALSE}
+old_model <- multinom(repay_fail ~ dti + annual_inc + dti*annual_inc, data = train)
+predict_old <- predict(old_model, newdata = val, type = "probs")
+predict_obj_old <- prediction(predict_old, val$repay_fail)
+performance_obj_old <- performance(predict_obj_old, "tpr","fpr")
+plot(performance_obj_old, col= "blue", main = "ROC Curves = Validation", lwd = 2)
+plot(performance_1, col = "red", add = TRUE, lwd = 2)
+legend("bottomright", legend = c("Old Model", "New Model"), col = c("blue", "red"), lwd = 2)
+```
+
+Based on the plot presented earlier, it is evident that the new model outperforms the old one. For a more comprehensive evaluation, we calculate both the Area Under the Curve (AUC) value and the Gini score to quantify the superiority of the new model over the old one.
+
+```{r}
+auc_1 <- performance(predict_obj_1, "auc")@y.values[[1]]
+cat("The Area Under Curve value for model 1 is ", auc_1, "\n")
+gini_1 <- 2*auc_1-1
+cat("The Gini score for model is ", gini_1, "\n")
+```
+
+The Gini score for the new model on the validation dataset is 0.354, which is a notable improvement when compared to the old model's Gini score of 0.110. This signifies an enhancement in predictive performance. Nevertheless, it's important to note that the current model does not incorporate several significant variables. As a result, we are in the process of fine-tuning the model and will evaluate its performance using the AIC (Akaike Information Criterion) with the same set of parameters. For tuning purpose, we tune the new model to see if the result performs better.
+
+```{r}
+model_2 <- multinom(repay_fail ~ int_rate + inq_last_6mths + pub_rec + revol_bal + revol_util + annual_inc + purpose + term + emp_length + home_ownership + verification_status , data = train)
+predict_2 <- predict(model_2, newdata = val, type = "probs")
+predict_obj_2 <- prediction(predict_2, val$repay_fail)
+performance_2 <- performance(predict_obj_2, "tpr", "fpr")
+summary(model_2)
+```
+
+The AIC of the tuned model is lower than that of the original model, suggesting an improvement in model performance. To validate this, we follow the same evaluation process as before, assessing both the AUC and Gini score.
+
+```{r}
+auc_2 <- performance(predict_obj_2, "auc")@y.values[[1]]
+cat("The Area Under Curve value for model 2 is ", auc_2, "\n")
+gini_2 <- 2*auc_2-1
+cat("The Gini score for model is ", gini_2, "\n")
+```
+
+For the evaluation result, the tuned model is slightly better than the original new model with better Gini score and lower AIC. For evaluation performance, ROC curve is generated for old and new model.
+
+```{r, echo = FALSE}
+old_model <- multinom(repay_fail ~ dti + annual_inc + loan_amnt, data = train)
+predict_old <- predict(old_model, newdata = val, type = "probs")
+predict_obj_old <- prediction(predict_old, val$repay_fail)
+performance_obj_old <- performance(predict_obj_old, "tpr","fpr")
+plot(performance_obj_old, col= "blue", main = "ROC Curves = Validation", lwd = 2)
+plot(performance_2, col = "red", add = TRUE, lwd = 2)
+legend("bottomright", legend = c("Old Model", "New Model"), col = c("blue", "red"), lwd = 2)
+
+```
+
+Evaluate the model on the test dataset on the predictive performance.
+
+```{r}
+predict_3 <- predict(model_2, newdata = test, type = "probs")
+predict_obj_3 <- prediction(predict_3, test$repay_fail)
+performance_3 <- performance(predict_obj_3, "tpr", "fpr")
+auc_2 <- performance(predict_obj_3, "auc")@y.values[[1]]
+cat("The Area Under Curve value for model 2 on test dataset is ", auc_2, "\n")
+gini_2 <- 2*auc_2-1
+cat("The Gini score for model on test dataset is ", gini_2, "\n")
+```
+
+# Discussion
+
+## Question 1 - How can new model be expected to perform on new loan applications?
+
+The variables chosen for the model primarily emphasize the borrower's credit history, financial behavior, and the nature of the loan applied for, rather than solely focusing on the borrower's income and debt-to-income ratio to evaluate loan affordability. It has been substantiated that the new model outperforms the previous one, underscoring the importance of gathering information related to the borrower's financial behavior and credit history when assessing the likelihood of loan default. Furthermore, credit history can be conveniently acquired and incorporated as a credit score from credit reporting agencies, such as Equifax.
+
+## Question 2 - What are the variables in the model and their explanation to effect of predicting credit risk?
+
+The important variables in the model can be categorized into two main groups: numerical variables and categorical variables. The model's performance, as indicated by the AUC value and Gini score, is closely aligned with the last tuned model.
+
+### Financial Behavior-Related Variables:
+
+pub_rec (Number of Derogatory Public Records): This variable represents the number of derogatory public records associated with the loan applicant, such as bankruptcies, tax liens, and judgments. A higher value of pub_rec is indicative of a riskier financial history and has a positive impact on predicting loan default. Lenders view a larger number of derogatory records as a red flag, raising concerns about the applicant's creditworthiness.
+
+revol_bal (Total Credit Revolving Balance): revol_bal measures the total amount of available revolving credit, including credit cards and lines of credit. This variable plays a crucial role in assessing an applicant's financial situation. While having a higher revol_bal can be seen as a sign of financial stability, extremely high balances may indicate a heavy reliance on credit and potential difficulties in managing additional debt.
+
+revol_util (Revolving Line Utilization Rate): revol_util quantifies the borrower's utilization of available revolving credit. High revol_util values signify that the borrower is using a significant portion of their available credit, which may increase the risk of loan default. Lenders closely monitor this variable to evaluate the applicant's credit management skills.
+
+inq_last_6mths (Inquiries in the Last 6 Months): This variable represents the number of credit inquiries made by the applicant within the last six months. It provides insights into the borrower's credit-seeking behavior. A higher number of inquiries can signal an increased interest in obtaining credit, potentially indicating higher risk.
+
+### Affordability and Loan Characteristics:
+
+Other important variables in the model include annual_inc (Annual Income), the interest rate (int_rate) of the loan applied and emp_length (Employment Length). These variables reflect the borrower's affordability and the nature of the loan. Higher income with long stable employment length and lower interest rates are generally associated with reduced credit risk, as they indicate the applicant's ability to repay the loan.
+
+By incorporating these variables into the model, we aim to provide a comprehensive assessment of credit risk by considering both the borrower's financial behavior and their financial capacity. The model's effectiveness in predicting credit risk is closely linked to the insights provided by these key variables.
+
+## How do these variables assess credit risk compare with those variables of traditional banking sector?
+
+In contrast to the traditional banking sector's focus on assessing a borrower's annual income and debt-to-income ratio to gauge credit risk, our new model offers a more comprehensive evaluation. [@ross2023] It takes into account not only the borrower's financial capacity but also their financial behavior, providing a more holistic assessment.
+
+# Part 2 - Addressing the last three questions.
+
+## Model selection
+
+### Variable selection
+
+Before building the model, we standardise all the numerical data for our convenience and avoiding any convergence error. We recognise that we should interpret the findings either based on the standardised units or convert the values back to represent its true values.
+
+```{r standardise, echo=TRUE}
+df$loan_amnt2 <- scale(df$loan_amnt)
+df$int_rate2 <- scale(df$int_rate)
+df$annual_inc2 <- scale(df$annual_inc)
+df$dti2 <- scale(df$dti)
+df$delinq_2yrs2 <- scale(df$delinq_2yrs)
+df$inq_last_6mths2 <- scale(df$inq_last_6mths)
+df$open_acc2 <- scale(df$open_acc)
+df$pub_rec2 <- scale(df$pub_rec)
+df$revol_bal2 <- scale(df$revol_bal)
+df$revol_util2 <- scale(df$revol_util)
+df$total_acc2 <- scale(df$total_acc)
+df$credit_age_yrs2 <- scale(df$credit_age_yrs)
+
+```
+
+# Question 3
+
+To address the third question whether accounting for state/zip-code and time variation can improve performance benchmarks, we fit the model on the intercept only model to investigate only variability of the random effects, in this case, they are the state (addr_state), the zip code (zip_code), and the month which the loan was funded (issue_d).
+
+### Intercept only model
+
+```{r fit1, include=TRUE}
+df <- within(df, sample <- factor(as.factor(addr_state):zip_code)) #handle zip_code nesting by creating a new variable
+
+interceptonlymodel <- lmer(formula = repay_fail ~ 1 + (1 | addr_state) + (1 | sample) + (1 | issue_d),
+                           data    = df) 
+
+summary(interceptonlymodel) #to get parameter estimates.
+```
+If we look at the different random effects in the model, we have:
+
+  + The 1st grouping variable is the state provided by the borrower in the loan application (addr_state)
+  + The 2nd grouping variable is the zip code provided by the borrower in the loan application. (zip_code, which is obviously nested under the addr_state)
+  + The 3rd grouping variable is the month which the loan was funded (issue_d)
+  + The random effects/slopes are based on an intercept, which is 1 in the formula.
+
+```{r fit2, message=FALSE, warning=FALSE, include=TRUE}
+0.0006808  / (0.1254492 + 0.0001795 + 0.0015281 + 0.0006808) * 100 #Variance of zip code nested under state
+0.0015281  / (0.1254492 + 0.0001795 + 0.0015281 + 0.0006808) * 100 #Variance of issue date
+0.0001795 / (0.1254492 + 0.0001795 + 0.0015281 + 0.0006808) * 100  #Variance of state
+0.1254492  / (0.1254492 + 0.0001795 + 0.0015281 + 0.0006808) * 100 #The residual variance
+```  
+It appears that The residual variance is 0.1254492, which is ~98%. The variability due to zip code nested under state is 0.0006808, which is ~0.53%. The variability due to trends that may exist over time is 0.0015281, which is ~1.2%. The variability due to state is 0.0001795, which is modest ~0.14% out of the total variance.  Hence, these random effects appears to poorly capture the variability of the model.
+
+### Propose model
+
+* Propose a mixed effects logistic regression model
+* loan_amnt, annual_inc, and dti as continuous predictors (initially)
+* term, purpose, emp_length as categorical predictors (initially)
+* Random intercept by issue_d i.e. a given trends that may exist over time or between different state/zip code may have influence on chance of loan default.
+
+* logit link function is initially selected as default.
+
+```{r fit m1, echo=TRUE, message=FALSE, warning=FALSE}
+df <- within(df, sample <- factor(as.factor(addr_state):zip_code))
+
+m1 <- glmer(
+  repay_fail ~ loan_amnt2 + annual_inc2 + dti2 
+  + term + purpose + emp_length 
+  + (1 | addr_state) + (1 | sample) + (1 | issue_d),
+  data = df,
+  family = binomial,
+  control = glmerControl(optimizer = "bobyqa"), 
+  nAGQ = 1 
+)
+
+# print the mod results without correlations among fixed effects
+#print(m, corr = FALSE)
+```
+
+```{r print m1, echo=TRUE, message=FALSE, warning=FALSE}
+# print the mod results without correlations among fixed effects
+print(m1, corr = FALSE)
+```
+
+```{r m1 2, echo=TRUE, message=FALSE, warning=FALSE}
+se1 <- sqrt(diag(vcov(m1)))
+# table of estimates with 95% CI
+(tab1 <- cbind(Est = fixef(m1), LL = fixef(m1) - 1.96 * se1, UL = fixef(m1) + 1.96 *
+    se1))
+```
+We investigate confidence intervals (CIs) of each variable to see if there is any variable is insignificant. Employment length doe not seem to be significant in our model.
+
+We exclude emp_length, then include revol_util2 and credit_age_yrs2 to see if AIC can be improved.
+
+```{r fit m2, echo=TRUE, message=FALSE, warning=FALSE}
+m2 <- glmer(
+  repay_fail ~ loan_amnt2 + annual_inc2 + dti2 + revol_util2 + credit_age_yrs2
+  + term + purpose 
+  + (1 | addr_state) + (1 | sample) + (1 | issue_d),
+  data = df,
+  family = binomial,
+  control = glmerControl(optimizer = "bobyqa"), 
+  nAGQ = 1 
+)
+```
+
+```{r print m2, echo=TRUE, message=FALSE, warning=FALSE}
+# print the mod results without correlations among fixed effects
+print(m2, corr = FALSE)
+```
+
+It appears that AIC is improved from 30221.38 in m1 to 29908.86 in m2. We further investigate if there is any room for improvement.
+
+```{r m2 2, echo=TRUE, message=FALSE, warning=FALSE}
+se2 <- sqrt(diag(vcov(m2)))
+# table of estimates with 95% CI
+(tab2 <- cbind(Est = fixef(m2), LL = fixef(m2) - 1.96 * se2, UL = fixef(m2) + 1.96 *
+    se2))
+```
+
+It appears that dti variable does not seem to be significant in the model 2. There are some purposes that does not significantly different from the reference purpose, such as credit_card with -0.28178495 lower limit and 0.10927497 upper limit of 95% confidential interval.
+
+We exclude dti2 from the model, and include delinq_2yrs and open_acc in the 3rd model.
+
+```{r fit m3, echo=TRUE, message=FALSE, warning=FALSE}
+m3 <- glmer(
+  repay_fail ~ loan_amnt2 + annual_inc2 + revol_util2 + credit_age_yrs2 + open_acc2 + delinq_2yrs2
+  + term + purpose 
+  + (1 | addr_state) + (1 | sample) + (1 | issue_d),
+  data = df,
+  family = binomial,
+  control = glmerControl(optimizer = "bobyqa"), 
+  nAGQ = 1 
+)
+```
+
+```{r print m3, echo=TRUE, message=FALSE, warning=FALSE}
+# print the mod results without correlations among fixed effects
+print(m3, corr = FALSE)
+```
+
+```{r m3 2, echo=TRUE, message=FALSE, warning=FALSE}
+se3 <- sqrt(diag(vcov(m3)))
+# table of estimates with 95% CI
+(tab3 <- cbind(Est = fixef(m3), LL = fixef(m3) - 1.96 * se3, UL = fixef(m3) + 1.96 *
+    se3))
+```
+
+As per the table of estimates with 95% CI of the 3rd model, the AIC score decrease to 29873.74, which is better than the first two models. Most of the covarients show a sign of significant in the model. The newly included variables, delinq_2yrs and open_acc, are significant with 95% confidential interval (LL and UL do not overlap 0).
+
+We include int_rate to see if the model can be improved or Interest Rate on the loan influence the prediction.
+
+```{r fit m4, echo=TRUE, message=FALSE, warning=FALSE}
+m4 <- glmer(
+  repay_fail ~ loan_amnt2 + annual_inc2 + revol_util2 + credit_age_yrs2 + open_acc2 + delinq_2yrs2 + int_rate2
+  + term + purpose 
+  + (1 | addr_state) + (1 | sample) + (1 | issue_d),
+  data = df,
+  family = binomial,
+  control = glmerControl(optimizer = "bobyqa"), 
+  nAGQ = 1 
+)
+```
+
+```{r print m4, echo=TRUE, message=FALSE, warning=FALSE}
+# print the mod results without correlations among fixed effects
+print(m4, corr = FALSE)
+```
+
+```{r m4 2, echo=TRUE, message=FALSE, warning=FALSE}
+se4 <- sqrt(diag(vcov(m4)))
+# table of estimates with 95% CI
+(tab4 <- cbind(Est = fixef(m4), LL = fixef(m4) - 1.96 * se4, UL = fixef(m4) + 1.96 *
+    se4))
+```
+
+It appears that Interest Rate on the loan strongly influence on the repay_fail response. The AIC decrease from 29873.74 to 29369.93 after adding int_rate2 variable. 
+
+We further include home_ownership in model 5, verification_status in model 6 and include both in model 7.
+
+```{r fit m5, echo=TRUE, message=FALSE, warning=FALSE}
+m5 <- glmer(
+  repay_fail ~ loan_amnt2 + annual_inc2 + revol_util2 + credit_age_yrs2 + open_acc2 + delinq_2yrs2 + int_rate2
+  + term + purpose + home_ownership 
+  + (1 | addr_state) + (1 | sample) + (1 | issue_d),
+  data = df,
+  family = binomial,
+  control = glmerControl(optimizer = "bobyqa"), 
+  nAGQ = 1 
+)
+
+m6 <- glmer(
+  repay_fail ~ loan_amnt2 + annual_inc2 + revol_util2 + credit_age_yrs2 + open_acc2 + delinq_2yrs2 + int_rate2
+  + term + purpose + verification_status
+  + (1 | addr_state) + (1 | sample) + (1 | issue_d),
+  data = df,
+  family = binomial,
+  control = glmerControl(optimizer = "bobyqa"), 
+  nAGQ = 1 
+)
+
+m7 <- glmer(
+  repay_fail ~ loan_amnt2 + annual_inc2 + revol_util2 + credit_age_yrs2 + open_acc2 + delinq_2yrs2 + int_rate2
+  + term + purpose + home_ownership + verification_status
+  + (1 | addr_state) + (1 | sample) + (1 | issue_d),
+  data = df,
+  family = binomial,
+  control = glmerControl(optimizer = "bobyqa"), 
+  nAGQ = 1 
+)
+```
+### AIC comparison
+
+```{r AICcomp1, echo=TRUE, message=FALSE, warning=FALSE}
+AIC(m1)
+AIC(m2)
+AIC(m3)
+AIC(m4)
+AIC(m5)
+AIC(m6)
+AIC(m7)
+```
+From the AIC scores, it is suggested that our 4th model has the best (lowest) AIC compared to the others. 
+The 4 model includes loan_amnt2 + annual_inc2 + revol_util2 + credit_age_yrs2 + open_acc2 + delinq_2yrs2 + int_rate2 as numerical predictors,
+term + purpose as categorical predictors, and (1 | addr_state) + (1 | sample) + (1 | issue_d) as random effects. It is worth noting that our models are compared based on the same random effects to reserve the reliability and validity of the models.
+
+```{r pois8, echo=TRUE}
+#StepwiseAIC
+#Specify full and null models:
+#full_model <- glmer(
+#  repay_fail ~ loan_amnt2 + annual_inc2 + purpose + credit_age_yrs2 + int_rate2 + open_acc2 + dti2 + delinq_2yrs2 + revol_bal2 + revol_util2 + pub_rec2 + term + verification_status + home_ownership + emp_length + (1 | addr_state) + (1 | sample) + (1 | issue_d),
+#  data = df,
+#  family = binomial,
+#  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 10000)), 
+#  nAGQ = 1 
+#)
+#null_model <- glmer(
+#  repay_fail ~ 1 + (1 | addr_state) + (1 | sample) + (1 | issue_d),
+#  data = df,
+#  family = binomial,
+#  control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 10000)), 
+#  nAGQ = 1 
+#)
+
+#Perform forward selection
+#forward_sel_model <- stepAIC(null_model,scope = formula(full_model), direction = "forward", trace = 0)
+
+```
+We also attempted to utilise Forward stepwise to aid us selecting variables. However, it seems to be inefficient and we faced a lots of problems during tweaking its settings.
+
+## Fit model
+
+* To obtain odds ratios instead of coefficients on the logit scale, we exponentiate the estimates and CIs. If Lower limit and Upper limit are in between 1, then the variable is insignificant.
+
+```{r m4 3, echo=TRUE, message=FALSE, warning=FALSE}
+exp(tab4)
+```
+
+Since we wanted odds ratios instead of coefficients on the logit scale, we could exponentiate the estimates and CIs. After we did that, use the confidence interval to interpret an odds ratio and draw the same conclusions as using the p-value.
+
+For all the variables that have confidence interval does not overlap 1 (revol_util2, credit_age_yrs2, open_acc2, int_rate2, term60 months, purposeeducational, purposemedical, purposemoving, purposeother, purposesmall_business, purposevacation). When these variable occurs, the repay_fail also increases in the standarised unit. Since it has been standardised. For example, term60 months has the odds ration = 1.57 on stadardised unit with 95per ci significant, the repay_fail increses in 60mnth term compared to 36mmth term.
+
+# Question 4
+
+Are there any surprising differences in variables that are important for predicting credit risk? 
+- The number of payments on the loan. Values are in months and can be either 36 or 60 (term).
+- A category provided by the borrower for the loan request (purpose).
+
+
+### Link function selection
+
+We then compare AIC scores from different link function in model4, which is our current best model.
+
+```{r fit m4 pro and clog, echo=TRUE, message=FALSE, warning=FALSE}
+m4probit <- glmer(
+  repay_fail ~ loan_amnt2 + annual_inc2 + revol_util2 + credit_age_yrs2 + open_acc2 + delinq_2yrs2 + int_rate2
+  + term + purpose 
+  + (1 | addr_state) + (1 | sample) + (1 | issue_d),
+  data = df,
+  family = binomial(link = "probit"),
+  control = glmerControl(optimizer = "bobyqa"), 
+  nAGQ = 1 
+)
+
+m4cloglog <- glmer(
+  repay_fail ~ loan_amnt2 + annual_inc2 + revol_util2 + credit_age_yrs2 + open_acc2 + delinq_2yrs2 + int_rate2
+  + term + purpose 
+  + (1 | addr_state) + (1 | sample) + (1 | issue_d),
+  data = df,
+  family = binomial(link = "cloglog"),
+  control = glmerControl(optimizer = "bobyqa"), 
+  nAGQ = 1 
+)
+```
+
+```{r AICcomp2, echo=TRUE}
+AIC(m4)
+AIC(m4probit)
+AIC(m4cloglog)
+
+```
+It is observed that the logit function model has AIC of 29359.22. The probit function model has the best AIC of 29369.93.The Complementary-log-log (cloglog) function model has the highest AIC of 29390.94. Both probit and logit link functions only have slightly different AIC scores, thus, we will continually use the default model with logit function for interpretation as it is commonly used in a field of statistics and it is easier to interpret in this regard.
+
+## Goodness-of-fit
+
+* Does the model fit the data?  Well?
+```{r DHARMa 2 plot, echo=TRUE, message=FALSE, warning=FALSE}
+# Simulate residuals and create DHARMa diagnostic plots
+res2 <- simulateResiduals(m4)
+plot(res2)
+
+#It is quite hard to see it in residuals plot so we are looking at the distribution of the random effects instead.
+```
+
+Dispersion test's p-value = 0.048, it suggests that the distribution of the simulated quantiles do not follow a uniform distribution. Additionally, there may be a pattern in the residuals when plotted against the predicted values at 50 percent quantile. We might say our data does not fit the binomial model well or we did not have enough covariates and the interaction terms to fit the model.
+
+```{r random effect dis, echo=TRUE}
+# Assuming you have already fitted the model and stored the random effects in 'res'
+res <- ranef(m4)
+
+# Access the random effects for 'addr_state'
+random_effects_addr_state <- res$addr_state
+
+# Create a histogram of the random effects
+hist(random_effects_addr_state[, 1], main = "Random Effects Distribution for addr_state")
+
+# Access the random effects for 'sample'
+random_effects_addr_sample <- res$sample
+
+# Create a histogram of the random effects
+hist(random_effects_addr_sample[, 1], main = "Random Effects Distribution for sample")
+
+# Access the random effects for 'issue_d'
+random_effects_addr_issue_d <- res$issue_d
+
+# Create a histogram of the random effects
+hist(random_effects_addr_issue_d[, 1], main = "Random Effects Distribution for issue_d")
+
+```
+
+Random effect distribution for sample presents a very standard normal distribution, where the means are clustered in the middle and the mean equals 0, which means there's no mistake with the data. However, there is a slight right skew in addr_state and a severe right skew in issue_d, both of which indicate that the means may not be normally distributed. The data may be abnormal.
+
+## Prediction
+
+* Distinction between predicting for the 'population' and for an individual
+* Could predict for the population based on the values of the fixed effects (only)
+* Could predict for individuals based on the values of the fixed effects and the random effects
+
+* Let's just consider predicting 'seen' data
+
+```{r pred,include=TRUE}
+# Predict probabilities using your mixed-effects logistic regression model 'm4'
+
+prob <- predict(m4, type = "response")
+
+# Load the 'pROC' package
+#library(pROC)
+
+# Create the ROC curve
+g <- roc(df$repay_fail, prob)
+
+# Plot the ROC curve
+plot(g)
+
+AUC <- g$auc # if it is closer 1, the model is predicting well # gini coefficient # confusion matrix 
+AUC
+Gini = 2 * (AUC-0.5)
+Gini
+```
+
+# Question 5
+
+As model 4 is the best model we found currently, we will use the fixed effect as the model 4. Next we first check if the state random effect and the time random effect is need by checking the AIC of the models.
+
+### The state random effect
+
+```{r fit m4_nostate, include=TRUE}
+m4_nostate <- glmer(
+  repay_fail ~ loan_amnt2 + annual_inc2 + revol_util2 + credit_age_yrs2 + open_acc2 + delinq_2yrs2 + int_rate2
+  + term + purpose 
+   + (1 | sample) + (1 | issue_d),
+  data = df,
+  family = binomial,
+  control = glmerControl(optimizer = "bobyqa"), 
+  nAGQ = 1 
+)
+```
+
+
+```{r AICcomp3}
+AIC(m4)
+AIC(m4_nostate)
+```
+
+The AIC of the model without state random effect is 29384.41, which is higher than the best model-**model 4** (29369.93). So, this suggest state random effect can help better explain the variance of credit risk. 
+
+From the following figure, we can also clearly see that there are differences in credit risk corresponding to each state, so that when we analyse the change of credit risk, we should take into account the state as a random effect, because there are differences in credit risk in different states.
+
+```{r}
+res <- ranef(m4)
+plot(res$addr_state[,1],main="Random effect of the state")
+```
+
+### The time random effect
+
+```{r fit m4_notime, include=TRUE}
+m4_notime <- glmer(
+  repay_fail ~ loan_amnt2 + annual_inc2 + revol_util2 + credit_age_yrs2 + open_acc2 + delinq_2yrs2 + int_rate2
+  + term + purpose 
+  + (1 | addr_state)+ (1 | sample),
+  data = df,
+  family = binomial,
+  control = glmerControl(optimizer = "bobyqa"), 
+  nAGQ = 1 
+)
+```
+
+
+```{r AICcomp4}
+AIC(m4)
+AIC(m4_notime)
+```
+
+The AIC of the model without time random effect is 29466.16, which is higher than the best model-**model 4**(29369.93).  So this suggest time random effect can help better explain the variance of credit risk. 
+
+From the following figure, we can clearly see that there are differences in credit risk corresponding to different time stamp. From plot, there are some specific time that the credit risk is much higher than the other times. So that when we analyse the trend of credit risk, we should take into account the time as a random effect, because there are differences in credit risk at different time.
+
+```{r}
+res <- ranef(m4)
+plot(res$issue_d[,1],main="Random effect of the time")
+```
